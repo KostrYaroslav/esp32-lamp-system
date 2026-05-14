@@ -1,0 +1,13 @@
+{
+    "version": 5,
+    "configurePresets": [
+        {
+            "name": "default",
+            "displayName": "Default Config",
+            "description": "Default build settings",
+            "cacheVariables": {
+                "IDF_TARGET": "esp32"
+            }
+        }
+    ]
+}

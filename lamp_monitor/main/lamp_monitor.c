@@ -11,7 +11,7 @@
 static const char *TAG = "MONITOR";
 
 // TODO: ЗАМЕНИТЕ на реальный MAC Главного (из лога main_esp)
-static uint8_t main_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static uint8_t main_mac[] = {0x20, 0x6E, 0xF1, 0x13, 0x99, 0xE4};
 
 // Состояние 15 ламп (бит 0 = лампа 1, бит 14 = лампа 15)
 static uint16_t lamp_state = 0x5555;
