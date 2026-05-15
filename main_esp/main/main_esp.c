@@ -251,6 +251,7 @@ void app_main(void) {
     init_uart();
     init_espnow();
 
-    xTaskCreatePinnedToCore(uart_task, "uart_task", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(command_task, "command_task", 4096, NULL, 5, NULL, 1);
+    // Исправлено: убрано PinnedToCore (ESP32-C6 однокорневой)
+    xTaskCreate(uart_task, "uart_task", 4096, NULL, 5, NULL);
+    xTaskCreate(command_task, "command_task", 4096, NULL, 5, NULL);
 }
