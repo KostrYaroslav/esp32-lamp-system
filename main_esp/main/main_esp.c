@@ -18,8 +18,8 @@
 static const char *TAG = "MAIN_ESP";
 
 // ==================== MAC-АДРЕСА ====================
-static const uint8_t monitor_mac[6]    = {0x44, 0x1D, 0x64, 0xF6, 0x91, 0x34};
-static const uint8_t controller_mac[6] = {0x68, 0xFE, 0x71, 0x88, 0x8E, 0x48};
+static const uint8_t monitor_mac[6]    = {0x44, 0x1D, 0x64, 0xF6, 0x91, 0x34}; // Смотрящий
+static const uint8_t controller_mac[6] = {0x68, 0xFE, 0x71, 0x88, 0x8E, 0x48}; // Управляющий
 
 // ==================== НАСТРОЙКИ ====================
 #define UART_GATEWAY_PORT   UART_NUM_1
@@ -29,7 +29,7 @@ static const uint8_t controller_mac[6] = {0x68, 0xFE, 0x71, 0x88, 0x8E, 0x48};
 #define QUEUE_SIZE          10
 #define WIFI_CHANNEL        1
 
-// Структура для безопасной передачи
+// Структура для передачи команд
 typedef struct {
     uint32_t mask;
     uint8_t action; // 0 = SET, 1 = CLR
@@ -39,14 +39,25 @@ static QueueHandle_t mask_queue = NULL;
 static _Atomic uint32_t lamp_state = ATOMIC_VAR_INIT(0x00000000);
 static volatile TaskHandle_t command_task_handle = NULL;
 
+// ==================== ОТПРАВКА СОСТОЯНИЯ ШЛЮЗУ ====================
+static void send_state_to_gateway(uint32_t state) {
+    char buffer[48];
+    snprintf(buffer, sizeof(buffer), "STATE %08" PRIX32 "\r\n", state);
+    uart_write_bytes(UART_GATEWAY_PORT, buffer, strlen(buffer));
+    ESP_LOGI(TAG, "📤 Состояние отправлено шлюзу: %08" PRIX32, state);
+}
+
 // ==================== ESP-NOW CALLBACKS ====================
 static void on_data_sent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
     if (tx_info != NULL && memcmp(tx_info->des_addr, controller_mac, 6) == 0) {
+        // Локальная копия защищает от Race Condition при смене контекста
         TaskHandle_t task_to_notify = command_task_handle;
         if (task_to_notify != NULL) {
             uint32_t notify_val = (status == ESP_NOW_SEND_SUCCESS) ? 1 : 2;
             BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            
             xTaskNotifyFromISR(task_to_notify, notify_val, eSetValueWithOverwrite, &xHigherPriorityTaskWoken);
+            
             if (xHigherPriorityTaskWoken == pdTRUE) {
                 portYIELD_FROM_ISR();
             }
@@ -63,11 +74,14 @@ static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, i
         memcpy(&temp, data, 4);
         atomic_store(&lamp_state, temp);
         ESP_LOGI(TAG, "📥 Статус от Смотрящего: %08" PRIX32, temp);
+        send_state_to_gateway(temp);
     } else if (len == 2) {
         uint16_t old_state;
         memcpy(&old_state, data, 2);
-        atomic_store(&lamp_state, (uint32_t)old_state);
+        uint32_t new_state = (uint32_t)old_state;
+        atomic_store(&lamp_state, new_state);
         ESP_LOGI(TAG, "📥 Статус от Смотрящего (16 бит): %04X", old_state);
+        send_state_to_gateway(new_state);
     }
 }
 
@@ -75,6 +89,7 @@ static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, i
 static bool send_mask_blocking(uint32_t mask) {
     uint32_t status_code = 0;
     
+    // Очищаем старые уведомления перед отправкой нового пакета
     xTaskNotifyWait(ULONG_MAX, ULONG_MAX, &status_code, 0);
     
     esp_err_t ret = esp_now_send(controller_mac, (const uint8_t*)&mask, sizeof(mask));
@@ -83,10 +98,11 @@ static bool send_mask_blocking(uint32_t mask) {
         return false;
     }
 
+    // Блокирующий таймаут ожидания подтверждения доставки
     BaseType_t notified = xTaskNotifyWait(ULONG_MAX, ULONG_MAX, &status_code, pdMS_TO_TICKS(500));
     
     if (notified == pdFALSE) {
-        ESP_LOGE(TAG, "❌ Таймаут ожидания ACK");
+        ESP_LOGE(TAG, "❌ Таймаут ожидания ACK от Управляющего");
         return false;
     }
 
@@ -94,7 +110,7 @@ static bool send_mask_blocking(uint32_t mask) {
         ESP_LOGI(TAG, "📤 Маска %08" PRIX32 " доставлена", mask);
         return true;
     } else {
-        ESP_LOGE(TAG, "❌ Нет ACK от Управляющего");
+        ESP_LOGE(TAG, "❌ Нет ACK от Управляющего (ошибка доставки)");
         return false;
     }
 }
@@ -116,7 +132,7 @@ static void init_espnow(void) {
 
     esp_now_peer_info_t peer = {0};
     peer.channel = WIFI_CHANNEL;
-    peer.ifidx = 0;  // ← ИСПРАВЛЕНО: ESP_IF_WIFI_STA = 0
+    peer.ifidx = 0;
     peer.encrypt = false;
     
     memcpy(peer.peer_addr, monitor_mac, 6);
@@ -176,7 +192,7 @@ static void uart_task(void *pvParameters) {
                     line[pos++] = data[i];
                 } else {
                     send_uart_response("ERROR BUFFER_OVERFLOW");
-                    pos = 0;
+                    pos = 0; // Сброс буфера для защиты от переполнения
                 }
             }
         }
@@ -200,9 +216,8 @@ static void init_uart(void) {
     ESP_LOGI(TAG, "✅ UART инициализирован (RX=%d, TX=%d)", UART_GATEWAY_RXD, UART_GATEWAY_TXD);
 }
 
-// ==================== ЛОГИКА ====================
+// ==================== ЛОГИКА ОБРАБОТКИ ====================
 static void command_task(void *pvParameters) {
-    command_task_handle = xTaskGetCurrentTaskHandle();
     command_msg_t msg;
 
     while (1) {
@@ -211,23 +226,27 @@ static void command_task(void *pvParameters) {
             uint32_t actual_mask = 0;
             
             if (msg.action == 0) {
+                // SET - включить лампы, которые выключены (инвертируем маску состояния)
                 actual_mask = msg.mask & (~current_state);
-                ESP_LOGI(TAG, "⚙️ SET: %08" PRIX32, msg.mask);
+                ESP_LOGI(TAG, "⚙️ SET: запрошено %08" PRIX32, msg.mask);
             } else {
+                // CLR - выключить лампы, которые сейчас включены
                 actual_mask = msg.mask & current_state;
-                ESP_LOGI(TAG, "⚙️ CLR: %08" PRIX32, msg.mask);
+                ESP_LOGI(TAG, "⚙️ CLR: запрошено %08" PRIX32, msg.mask);
             }
             
             if (actual_mask != 0) {
-                ESP_LOGI(TAG, "   Текущее: %08" PRIX32, current_state);
-                ESP_LOGI(TAG, "   Импульс: %08" PRIX32, actual_mask);
+                ESP_LOGI(TAG, "   Текущее состояние: %08" PRIX32, current_state);
+                ESP_LOGI(TAG, "   Отправляем импульс на: %08" PRIX32 " (%d реле)", 
+                         actual_mask, __builtin_popcount(actual_mask));
+                
                 if (send_mask_blocking(actual_mask)) {
-                    ESP_LOGI(TAG, "   ✅ Успешно");
+                    ESP_LOGI(TAG, "   ✅ Импульс успешно передан");
                 } else {
-                    ESP_LOGE(TAG, "   ❌ Ошибка");
+                    ESP_LOGE(TAG, "   ❌ Не удалось передать импульс");
                 }
             } else {
-                ESP_LOGI(TAG, "   💡 Изменений не требуется");
+                ESP_LOGI(TAG, "   💡 Изменений не требуется (лампы уже в нужном состоянии)");
             }
         }
     }
@@ -248,10 +267,21 @@ void app_main(void) {
         return;
     }
 
+    // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Таск создается до старта ESP-NOW. Указатель command_task_handle гарантированно валиден.
+    xTaskCreate(command_task, "command_task", 4096, NULL, 5, (TaskHandle_t *)&command_task_handle);
+
     init_uart();
     init_espnow();
 
-    // Исправлено: убрано PinnedToCore (ESP32-C6 однокорневой)
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
+    ESP_LOGI(TAG, "🟢 Главный (ESP32-C6) запущен");
+    ESP_LOGI(TAG, "📡 MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "⚙️ Режим: SET/CLR раздельно, обратная связь включена");
+    ESP_LOGI(TAG, "📡 UART: RX=%d, TX=%d", UART_GATEWAY_RXD, UART_GATEWAY_TXD);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
+
     xTaskCreate(uart_task, "uart_task", 4096, NULL, 5, NULL);
-    xTaskCreate(command_task, "command_task", 4096, NULL, 5, NULL);
 }
