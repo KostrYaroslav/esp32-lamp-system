@@ -1,13 +1,13 @@
 #include <stdio.h>
 #include <string.h>
-#include <inttypes.h>           // ДОБАВИТЬ для PRIX32
+#include <stdlib.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_mac.h"
 #include "driver/gpio.h"
@@ -24,7 +24,7 @@ static const char *TAG = "CONTROLLER";
 static uint8_t main_mac[] = {0x20, 0x6E, 0xF1, 0x13, 0x99, 0xE4};
 
 // ==================== ПАРАМЕТРЫ ====================
-#define PULSE_DURATION_MS 500     
+#define PULSE_DURATION_MS 500
 #define QUEUE_SIZE        10
 
 // ==================== ОЧЕРЕДЬ КОМАНД ====================
@@ -46,7 +46,11 @@ static void hc595_init(void) {
     };
     gpio_config(&io_conf);
     
-    gpio_set_level(HC595_OE_PIN, 0);
+    // Явное подавление переходных процессов при старте
+    gpio_set_level(HC595_CLOCK_PIN, 0);
+    gpio_set_level(HC595_LATCH_PIN, 0);
+    gpio_set_level(HC595_OE_PIN, 0); 
+    
     ESP_LOGI(TAG, "✅ SN74HC595 инициализирован (32 реле)");
 }
 
@@ -79,27 +83,24 @@ static void hc595_set_channels(uint32_t mask, bool state) {
 // ==================== ESP-NOW CALLBACK ====================
 
 static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    uint32_t mask = 0;
-    
     if (len == 4) {
+        uint32_t mask;
         memcpy(&mask, data, 4);
-    } else if (len == 2) {
-        uint16_t val;
-        memcpy(&val, data, 2);
-        mask = val;
-    } else if (len == 1) {
-        mask = data[0];
+        
+        if (mask == 0) return;
+        
+        ESP_LOGI(TAG, "📨 Получена маска: %08" PRIX32 " (%d реле)", 
+                 mask, __builtin_popcount(mask));
+        
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        if (xQueueSendFromISR(mask_queue, &mask, &xHigherPriorityTaskWoken) != pdTRUE) {
+            ESP_LOGW(TAG, "⚠️ Очередь переполнена, маска утеряна");
+        }
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
+        }
     } else {
         ESP_LOGW(TAG, "❌ Неверная длина данных: %d", len);
-        return;
-    }
-    
-    if (mask == 0) return;
-
-    // Безопасная отправка в очередь из контекста прерывания WiFi
-    if (xQueueSendFromISR(mask_queue, &mask, NULL) != pdPASS) {
-        // ИСПРАВЛЕНО: добавлен PRIX32
-        ESP_LOGW(TAG, "⚠️ Очередь переполнена! Пропущена маска: %08" PRIX32, mask);
     }
 }
 
@@ -108,13 +109,14 @@ static void init_espnow(void) {
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
     
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_recv));
     
     esp_now_peer_info_t peer = {
-        .channel = 0,
-        .ifidx = 0,           // ИСПРАВЛЕНО: 0 вместо WIFI_IF_STA
+        .channel = 1,
+        .ifidx = WIFI_IF_STA,
         .encrypt = false,
     };
     memcpy(peer.peer_addr, main_mac, 6);
@@ -122,12 +124,33 @@ static void init_espnow(void) {
     esp_err_t err = esp_now_add_peer(&peer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Ошибка добавления peer: %d", err);
-    } else {
-        ESP_LOGI(TAG, "✅ Peer Главного добавлен");
     }
 }
 
-// ==================== ОСНОВНОЙ ПОТОК ОБРАБОТКИ ====================
+// ==================== ПОТОК ОБРАБОТКИ ИМПУЛЬСОВ ====================
+
+static void command_task(void *pvParameters) {
+    uint32_t requested_mask = 0;
+
+    while (1) {
+        // Задача засыпает тут, если очередь пуста. Не тратит ресурсы CPU.
+        if (xQueueReceive(mask_queue, &requested_mask, portMAX_DELAY) == pdTRUE) {
+            
+            // Включаем каналы
+            hc595_set_channels(requested_mask, true);
+            ESP_LOGI(TAG, "🔛 Импульс запущен: %08" PRIX32, requested_mask);
+            
+            // Точная атомарная задержка на время импульса
+            vTaskDelay(pdMS_TO_TICKS(PULSE_DURATION_MS));
+            
+            // Выключаем каналы
+            hc595_set_channels(requested_mask, false);
+            ESP_LOGI(TAG, "🔴 Импульс завершён: %08" PRIX32, requested_mask);
+        }
+    }
+}
+
+// ==================== MAIN ====================
 
 void app_main(void) {
     esp_err_t ret = nvs_flash_init();
@@ -136,34 +159,33 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    
+
     mask_queue = xQueueCreate(QUEUE_SIZE, sizeof(uint32_t));
     if (mask_queue == NULL) {
-        ESP_LOGE(TAG, "❌ Не удалось создать очередь");
+        ESP_LOGE(TAG, "❌ Ошибка создания очереди");
         return;
     }
-    
+
     hc595_init();
-    init_espnow();
     
+    // Принудительное гашение всех регистров при старте
+    hc595_set_channels(0xFFFFFFFF, false);
+
+    init_espnow();
+
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
+    ESP_LOGI(TAG, "🟢 Управляющий запущен (32 реле, импульс %d мс)", PULSE_DURATION_MS);
     ESP_LOGI(TAG, "📡 MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "🟢 Управляющий запущен (32 реле, импульс %d мс)", PULSE_DURATION_MS);
-    
-    uint32_t active_mask = 0;
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
 
+    // Выделен высокий приоритет (5) для минимизации джиттера импульсов
+    xTaskCreate(command_task, "command_task", 4096, NULL, 5, NULL);
+
+    // Главный цикл теперь свободен и может использоваться для других задач
     while (1) {
-        if (xQueueReceive(mask_queue, &active_mask, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "🔛 Включение маски: %08" PRIX32 " (%d реле)", 
-                     active_mask, __builtin_popcount(active_mask));
-            hc595_set_channels(active_mask, true);
-            
-            vTaskDelay(pdMS_TO_TICKS(PULSE_DURATION_MS));
-            
-            hc595_set_channels(active_mask, false);
-            ESP_LOGI(TAG, "🔴 Выключение маски: %08" PRIX32, active_mask);
-        }
+        vTaskDelay(portMAX_DELAY);
     }
 }
