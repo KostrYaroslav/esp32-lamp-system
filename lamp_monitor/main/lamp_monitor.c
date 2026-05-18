@@ -18,37 +18,33 @@ static const char *TAG = "MONITOR";
 
 // ==================== НАСТРОЙКИ ====================
 #define RELAY_COUNT        32
-#define SEND_INTERVAL_MS   30000           
 #define WIFI_CHANNEL       1
 
 // ==================== ESP-NOW ====================
-static const uint8_t main_mac[6] = {0x20, 0x6E, 0xF1, 0x13, 0x99, 0xE4};  
+// MAC Главного (ESP32-C6 №2)
+static const uint8_t main_mac[6] = {0x20, 0x6E, 0xF1, 0x13, 0x99, 0xE4};
 
 // ==================== ОЧЕРЕДЬ СОБЫТИЙ ====================
 typedef enum {
-    EV_SEND_SPONTANEOUS,
     EV_SEND_REQUESTED
 } event_type_t;
 
 static QueueHandle_t event_queue = NULL;
 
 // ==================== СОСТОЯНИЕ ЛАМП ====================
-static _Atomic uint32_t lamp_state = ATOMIC_VAR_INIT(0x55555555);  
-static esp_timer_handle_t status_timer = NULL;
-static uint32_t emulation_counter = 0x55555555;
-
-// Функция генерирует новое состояние
-static void generate_emulated_state(void) {
-    emulation_counter = (emulation_counter << 1) | ((emulation_counter >> 31) & 1);
-    atomic_store(&lamp_state, emulation_counter);
-    ESP_LOGI(TAG, "🎲 Эмуляция: генерировано новое состояние %08" PRIX32, emulation_counter);
-}
+// ФИКСИРОВАННОЕ СОСТОЯНИЕ: лампы 1, 3, 17 включены
+// Бит 0 = лампа 1 (1 << 0) = 0x00000001
+// Бит 2 = лампа 3 (1 << 2) = 0x00000004
+// Бит 16 = лампа 17 (1 << 16) = 0x00010000
+// Итого: 0x00010005
+static _Atomic uint32_t lamp_state = ATOMIC_VAR_INIT(0x00010005);
 
 // ==================== ОТПРАВКА СТАТУСА ====================
 static void send_status(uint32_t state) {
     esp_err_t ret = esp_now_send(main_mac, (const uint8_t*)&state, sizeof(state));
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "📤 Статус отправлен в сеть: %08" PRIX32, state);
+        ESP_LOGI(TAG, "📤 Статус отправлен: %08" PRIX32, state);
+        ESP_LOGI(TAG, "   Включены лампы: 1, 3, 17");
     } else {
         ESP_LOGE(TAG, "❌ Ошибка отправки: %s", esp_err_to_name(ret));
     }
@@ -59,9 +55,8 @@ static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, i
     if (info == NULL || data == NULL || len <= 0) return;
     if (memcmp(info->src_addr, main_mac, 6) != 0) return;
 
-    if (len == 1 && data[0] == 0x01) {  
+    if (len == 1 && data[0] == 0x01) {
         event_type_t ev = EV_SEND_REQUESTED;
-        // Из реального прерывания Wi-Fi используем FromISR
         xQueueSendFromISR(event_queue, &ev, NULL);
     }
 }
@@ -91,7 +86,7 @@ static void init_espnow(void) {
 
     esp_now_peer_info_t peer = {
         .channel = WIFI_CHANNEL,
-        .ifidx = WIFI_IF_STA, // ✅ Изменено: Явный интерфейс вместо 0
+        .ifidx = 0,
         .encrypt = false,
     };
     memcpy(peer.peer_addr, main_mac, 6);
@@ -100,41 +95,13 @@ static void init_espnow(void) {
     ESP_LOGI(TAG, "📡 Peer Главного добавлен");
 }
 
-// ==================== ТАЙМЕР ДЛЯ ЭМУЛЯЦИИ ====================
-static void timer_callback(void *arg) {
-    event_type_t ev = EV_SEND_SPONTANEOUS;
-    // ✅ Изменено: esp_timer — это не ISR, используем обычный xQueueSend
-    xQueueSend(event_queue, &ev, 0);
-}
-
-static void init_timer(void) {
-    esp_timer_create_args_t timer_args = {
-        .callback = &timer_callback,
-        .name = "status_timer"
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &status_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(status_timer, SEND_INTERVAL_MS * 1000));
-}
-
 // ==================== ЗАДАЧА ОТПРАВКИ ====================
 static void monitor_tx_task(void *pvParameters) {
     event_type_t ev;
     while (1) {
         if (xQueueReceive(event_queue, &ev, portMAX_DELAY) == pdTRUE) {
-            
-            // ✅ Изменено: Обновляем состояние ДО отправки, чтобы исключить дубли при старте
-            if (ev == EV_SEND_SPONTANEOUS) {
-                generate_emulated_state();
-            }
-
             uint32_t current_state = atomic_load(&lamp_state);
-            
-            if (ev == EV_SEND_REQUESTED) {
-                ESP_LOGI(TAG, "🔍 Отправка по запросу: %08" PRIX32, current_state);
-            } else {
-                ESP_LOGI(TAG, "⏰ Плановая отправка: %08" PRIX32, current_state);
-            }
-            
+            ESP_LOGI(TAG, "🔍 Отправка по запросу: %08" PRIX32, current_state);
             send_status(current_state);
         }
     }
@@ -158,18 +125,16 @@ void app_main(void) {
     xTaskCreate(monitor_tx_task, "monitor_tx_task", 4096, NULL, 5, NULL);
 
     init_espnow();
-    
-    atomic_store(&lamp_state, emulation_counter);
-    
-    init_timer();
 
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
-    ESP_LOGI(TAG, "🟢 Смотрящий запущен (ЭМУЛЯЦИЯ)");
+    ESP_LOGI(TAG, "🟢 Смотрящий запущен (ФИКСИРОВАННОЕ СОСТОЯНИЕ)");
     ESP_LOGI(TAG, "📡 MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "🎮 Отправка каждые %d секунд", SEND_INTERVAL_MS / 1000);
-    ESP_LOGI(TAG, "🔍 Поддерживаются запросы GET_STATE");
+    ESP_LOGI(TAG, "💡 Постоянное состояние: лампы 1, 3, 17 включены");
+    ESP_LOGI(TAG, "🔍 Отвечаю только на запросы GET_STATE");
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
+    
+    // Таймер ОТКЛЮЧЁН — состояние никогда не меняется
 }
