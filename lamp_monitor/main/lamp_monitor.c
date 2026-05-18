@@ -37,42 +37,20 @@ static _Atomic uint32_t lamp_state = ATOMIC_VAR_INIT(0x55555555);
 static esp_timer_handle_t status_timer = NULL;
 static uint32_t emulation_counter = 0x55555555;
 
+// Функция генерирует новое состояние
 static void generate_emulated_state(void) {
     emulation_counter = (emulation_counter << 1) | ((emulation_counter >> 31) & 1);
     atomic_store(&lamp_state, emulation_counter);
-    ESP_LOGI(TAG, "🎲 Эмуляция: новое состояние %08" PRIX32, emulation_counter);
+    ESP_LOGI(TAG, "🎲 Эмуляция: генерировано новое состояние %08" PRIX32, emulation_counter);
 }
 
 // ==================== ОТПРАВКА СТАТУСА ====================
 static void send_status(uint32_t state) {
     esp_err_t ret = esp_now_send(main_mac, (const uint8_t*)&state, sizeof(state));
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "📤 Статус отправлен: %08" PRIX32, state);
+        ESP_LOGI(TAG, "📤 Статус отправлен в сеть: %08" PRIX32, state);
     } else {
         ESP_LOGE(TAG, "❌ Ошибка отправки: %s", esp_err_to_name(ret));
-    }
-}
-
-// ==================== ЗАДАЧА ОБРАБОТКИ И ОТПРАВКИ ====================
-static void monitor_tx_task(void *pvParameters) {
-    event_type_t ev;
-    while (1) {
-        if (xQueueReceive(event_queue, &ev, portMAX_DELAY) == pdTRUE) {
-            uint32_t current_state = atomic_load(&lamp_state);
-            
-            if (ev == EV_SEND_REQUESTED) {
-                ESP_LOGI(TAG, "🔍 Обработка запроса, отправляю: %08" PRIX32, current_state);
-            } else {
-                ESP_LOGD(TAG, "⏰ Плановая отправка: %08" PRIX32, current_state);
-            }
-            
-            send_status(current_state);
-            
-            // Если отправка была плановой по таймеру — обновляем состояние для следующего раза
-            if (ev == EV_SEND_SPONTANEOUS) {
-                generate_emulated_state();
-            }
-        }
     }
 }
 
@@ -83,12 +61,12 @@ static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, i
 
     if (len == 1 && data[0] == 0x01) {  
         event_type_t ev = EV_SEND_REQUESTED;
-        // Отправляем событие в очередь без блокировки
+        // Из реального прерывания Wi-Fi используем FromISR
         xQueueSendFromISR(event_queue, &ev, NULL);
     }
 }
 
-// ==================== ESP-NOW CALLBACK СТАТУСА ====================
+// ==================== ESP-NOW ====================
 static void on_data_sent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
         ESP_LOGD(TAG, "✅ Доставлено");
@@ -113,7 +91,7 @@ static void init_espnow(void) {
 
     esp_now_peer_info_t peer = {
         .channel = WIFI_CHANNEL,
-        .ifidx = WIFI_IF_STA, // Явно указываем интерфейс STA вместо 0
+        .ifidx = WIFI_IF_STA, // ✅ Изменено: Явный интерфейс вместо 0
         .encrypt = false,
     };
     memcpy(peer.peer_addr, main_mac, 6);
@@ -125,8 +103,8 @@ static void init_espnow(void) {
 // ==================== ТАЙМЕР ДЛЯ ЭМУЛЯЦИИ ====================
 static void timer_callback(void *arg) {
     event_type_t ev = EV_SEND_SPONTANEOUS;
-    // Безопасно отправляем событие в очередь из прерывания таймера
-    xQueueSendFromISR(event_queue, &ev, NULL);
+    // ✅ Изменено: esp_timer — это не ISR, используем обычный xQueueSend
+    xQueueSend(event_queue, &ev, 0);
 }
 
 static void init_timer(void) {
@@ -138,6 +116,30 @@ static void init_timer(void) {
     ESP_ERROR_CHECK(esp_timer_start_periodic(status_timer, SEND_INTERVAL_MS * 1000));
 }
 
+// ==================== ЗАДАЧА ОТПРАВКИ ====================
+static void monitor_tx_task(void *pvParameters) {
+    event_type_t ev;
+    while (1) {
+        if (xQueueReceive(event_queue, &ev, portMAX_DELAY) == pdTRUE) {
+            
+            // ✅ Изменено: Обновляем состояние ДО отправки, чтобы исключить дубли при старте
+            if (ev == EV_SEND_SPONTANEOUS) {
+                generate_emulated_state();
+            }
+
+            uint32_t current_state = atomic_load(&lamp_state);
+            
+            if (ev == EV_SEND_REQUESTED) {
+                ESP_LOGI(TAG, "🔍 Отправка по запросу: %08" PRIX32, current_state);
+            } else {
+                ESP_LOGI(TAG, "⏰ Плановая отправка: %08" PRIX32, current_state);
+            }
+            
+            send_status(current_state);
+        }
+    }
+}
+
 // ==================== MAIN ====================
 void app_main(void) {
     esp_err_t ret = nvs_flash_init();
@@ -147,14 +149,12 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Создаем очередь перед запуском задач и прерываний
     event_queue = xQueueCreate(10, sizeof(event_type_t));
     if (event_queue == NULL) {
         ESP_LOGE(TAG, "❌ Ошибка создания очереди");
         return;
     }
 
-    // Запуск рабочей задачи для отправки сообщений (приоритет 5)
     xTaskCreate(monitor_tx_task, "monitor_tx_task", 4096, NULL, 5, NULL);
 
     init_espnow();
@@ -166,7 +166,7 @@ void app_main(void) {
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
-    ESP_LOGI(TAG, "🟢 Смотрящий запущен (БЕЗОПАСНАЯ ОЧЕРЕДЬ)");
+    ESP_LOGI(TAG, "🟢 Смотрящий запущен (ЭМУЛЯЦИЯ)");
     ESP_LOGI(TAG, "📡 MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     ESP_LOGI(TAG, "🎮 Отправка каждые %d секунд", SEND_INTERVAL_MS / 1000);
