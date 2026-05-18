@@ -31,4 +31,4 @@ void app_main(void) {
     // Запуск задач
     parser_start_task();      // терминал (HELP, ON, OFF, STATUS...)
     uart_start_rx_task();     // приём STATE от Главного
-}
+}  
