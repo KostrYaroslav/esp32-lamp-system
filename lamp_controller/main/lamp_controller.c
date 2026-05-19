@@ -31,10 +31,10 @@ static const uint8_t main_mac[6] = {0x20, 0x6E, 0xF1, 0x13, 0x99, 0xE4};
 // ==================== ПАРАМЕТРЫ ИМПУЛЬСА ====================
 #define PULSE_DURATION_MS 500
 
-// Структура пакета от Главного (ровно 5 байт)
+// Структура пакета от Главного
 typedef struct {
-    uint32_t mask;
-    uint8_t action;  // 1 = Включить, 0 = Выключить (оба подают импульс)
+    uint32_t mask;      // какие лампы должны получить импульс
+    uint8_t action;     // не используется (для совместимости)
 } __attribute__((packed)) controller_pkt_t;
 
 // ==================== СИСТЕМНЫЕ ОБЪЕКТЫ ====================
@@ -51,7 +51,7 @@ static void channel_timeout_callback(void* arg);
 // ==================== SN74HC595 ФУНКЦИИ ====================
 
 static void hc595_init(void) {
-    // Шаг 1: Сразу выставляем OE в 1, чтобы заблокировать выходы реле до очистки регистра
+    // Шаг 1: Блокируем выходы до очистки регистра
     gpio_set_level(HC595_OE_PIN, 1);
 
     gpio_config_t io_conf = {
@@ -69,8 +69,7 @@ static void hc595_init(void) {
     gpio_set_level(HC595_CLOCK_PIN, 0);
     gpio_set_level(HC595_LATCH_PIN, 0);
     
-    // Шаг 2: Принудительно заполняем регистры нулями
-    gpio_set_level(HC595_LATCH_PIN, 0);
+    // Шаг 2: Очищаем регистры (записываем 32 нуля)
     for (int i = 0; i < 32; i++) {
         gpio_set_level(HC595_DATA_PIN, 0);
         gpio_set_level(HC595_CLOCK_PIN, 1);
@@ -78,7 +77,7 @@ static void hc595_init(void) {
     }
     gpio_set_level(HC595_LATCH_PIN, 1);
 
-    // Шаг 3: Разрешаем работу выходов (низкий уровень), теперь это безопасно
+    // Шаг 3: Разрешаем выходы
     gpio_set_level(HC595_OE_PIN, 0); 
     
     ESP_LOGI(TAG, "✅ SN74HC595 инициализирован (32 канала)");
@@ -94,7 +93,7 @@ static inline void hc595_write_byte(uint8_t data) {
 
 static void hc595_update(uint32_t state) {
     gpio_set_level(HC595_LATCH_PIN, 0);
-    // Отправляем 4 байта последовательно, начиная со старшего байта
+    // Отправляем 4 байта (старший → младший)
     hc595_write_byte((state >> 24) & 0xFF);
     hc595_write_byte((state >> 16) & 0xFF);
     hc595_write_byte((state >> 8) & 0xFF);
@@ -103,26 +102,24 @@ static void hc595_update(uint32_t state) {
 }
 
 static void hc595_set_channels(uint32_t mask, bool state) {
-    uint32_t local_state;
-    
-    // Защита критической секцией от одновременного изменения из разных таймеров
     portENTER_CRITICAL(&reg_mux);
+    
     if (state) {
         shift_reg_state |= mask;
     } else {
         shift_reg_state &= ~mask;
     }
-    local_state = shift_reg_state;
+    
+    // Исправлено: Обновление пинов происходит внутри критической секции.
+    hc595_update(shift_reg_state);
+    
     portEXIT_CRITICAL(&reg_mux);
-
-    hc595_update(local_state);
 }
 
-// Коллбэк аппаратного таймера: срабатывает изолированно для конкретного реле
+// Коллбэк таймера: выключает конкретное реле
 static void channel_timeout_callback(void* arg) {
     uint32_t channel_idx = (uint32_t)(uintptr_t)arg;
     uint32_t mask = (1UL << channel_idx);
-    
     hc595_set_channels(mask, false);
 }
 
@@ -135,19 +132,23 @@ static void init_channel_timers(void) {
         };
         ESP_ERROR_CHECK(esp_timer_create(&timer_args, &channel_timers[i]));
     }
-    ESP_LOGI(TAG, "✅ Инициализировано 32 независимых таймера импульсов");
+    ESP_LOGI(TAG, "✅ Инициализировано 32 таймера");
 }
 
 // ==================== ESP-NOW ПРИЁМ ====================
 
 static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    // Проверка MAC-адреса отправителя (принимаем только от Главного)
+    if (memcmp(info->src_addr, main_mac, 6) != 0) {
+        return;
+    }
+
     if (len == sizeof(controller_pkt_t)) {
         controller_pkt_t pkt;
         memcpy(&pkt, data, sizeof(pkt));
         
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         
-        // Отправляем структуру пакета в очередь
         if (xQueueSendFromISR(mask_queue, &pkt, &xHigherPriorityTaskWoken) == pdTRUE) {
             if (xHigherPriorityTaskWoken) {
                 portYIELD_FROM_ISR();
@@ -159,6 +160,7 @@ static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, i
 static void init_espnow(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
@@ -174,39 +176,30 @@ static void init_espnow(void) {
     memcpy(peer.peer_addr, main_mac, 6);
     
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
-    ESP_LOGI(TAG, "✅ Передатчик (Главный) успешно добавлен в Peer");
+    ESP_LOGI(TAG, "✅ Peer Главного добавлен");
 }
 
-// ==================== ПОТОК ОБРАБОТКИ КОМАНД ====================
+// ==================== ЗАДАЧА ОБРАБОТКИ ====================
 
 static void command_task(void *pvParameters) {
     controller_pkt_t cmd;
 
     while (1) {
-        // Очередь блокирует поток, пока нет новых данных
         if (xQueueReceive(mask_queue, &cmd, portMAX_DELAY) == pdTRUE) {
+            if (cmd.mask == 0) continue;
             
-            // Защита: если пришла пустая маска, игнорируем пакет
-            if (cmd.mask == 0) {
-                continue;
-            }
-
-            // Для бистабильных контакторов всегда подаём высокий уровень (true)
+            // Даём импульс по маске
             hc595_set_channels(cmd.mask, true);
             
-            // Запускаем независимые таймеры для каждого бита маски
+            // Запускаем таймеры выключения для каждого активного канала
             for (int i = 0; i < 32; i++) {
                 if ((cmd.mask >> i) & 1) {
-                    esp_timer_stop(channel_timers[i]); // Сброс старого таймера
-                    esp_timer_start_once(channel_timers[i], PULSE_DURATION_MS * 1000ULL);
+                    esp_timer_stop(channel_timers[i]); // Сброс таймера, если он уже работал
+                    ESP_ERROR_CHECK(esp_timer_start_once(channel_timers[i], PULSE_DURATION_MS * 1000ULL));
                 }
             }
-
-            if (cmd.action == 1) {
-                ESP_LOGI(TAG, "🔛 Импульс ВКЛЮЧЕНИЯ: маска %08" PRIX32, cmd.mask);
-            } else {
-                ESP_LOGI(TAG, "🛑 Импульс ВЫКЛЮЧЕНИЯ: маска %08" PRIX32, cmd.mask);
-            }
+            
+            ESP_LOGI(TAG, "⚡ Импульс по маске: %08" PRIX32, cmd.mask);
         }
     }
 }
@@ -214,7 +207,7 @@ static void command_task(void *pvParameters) {
 // ==================== MAIN ====================
 
 void app_main(void) {
-    // Инициализация NVS памяти
+    // Инициализация NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -222,39 +215,36 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Обязательная системная инициализация сетевых интерфейсов
+    // Инициализация сетевых интерфейсов
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Создаем очередь для передачи полных структур пакетов
+    // Создание очереди
     mask_queue = xQueueCreate(QUEUE_SIZE, sizeof(controller_pkt_t));
     if (mask_queue == NULL) {
-        ESP_LOGE(TAG, "❌ Критическая ошибка: Не удалось создать очередь FreeRTOS");
+        ESP_LOGE(TAG, "❌ Ошибка создания очереди");
         return;
     }
 
-    // Настройка периферии
+    // Настройка SN74HC595 и таймеров
     hc595_init();
     init_channel_timers();
-    hc595_set_channels(0xFFFFFFFF, false); // Гарантированно гасим все реле при старте
-    ESP_LOGI(TAG, "🔄 Все каналы принудительно сброшены в 0");
+    hc595_set_channels(0xFFFFFFFF, false); // Гарантированно выключаем все каналы при старте
+    ESP_LOGI(TAG, "🔄 Все реле принудительно выключены");
 
-    // Запуск беспроводной связи
+    // Запуск ESP-NOW
     init_espnow();
 
-    // Вывод лога успешного запуска
+    // Вывод MAC-адреса устройства для отладки
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
-    ESP_LOGI(TAG, "🟢 Контроллер реле успешно запущен!");
-    ESP_LOGI(TAG, "📡 Собственный MAC-адрес: %02X:%02X:%02X:%02X:%02X:%02X", 
+    ESP_LOGI(TAG, "🟢 Управляющий запущен (ИСПОЛНИТЕЛЬ)");
+    ESP_LOGI(TAG, "📡 MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "⏱️ Заданная длительность импульса: %d мс", PULSE_DURATION_MS);
+    ESP_LOGI(TAG, "⚡ Длительность импульса: %d мс", PULSE_DURATION_MS);
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
 
-    // Создаем высокоприоритетную задачу для управления реле
+    // Запуск задачи обработки (выделяем 4Кб стека, приоритет 10, закреплена за ядром 1)
     xTaskCreatePinnedToCore(command_task, "command_task", 4096, NULL, 10, NULL, 1);
-
-    // Чистый выход из app_main
-    return;
 }
