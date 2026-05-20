@@ -1,9 +1,6 @@
 idf_component_register(
     SRCS 
         "main.c"
-        "command_parser.c"
-        "state_manager.c"
-        "espnow_handler.c"
         "uart_handler.c"
     INCLUDE_DIRS "."
     REQUIRES 
@@ -11,5 +8,4 @@ idf_component_register(
         nvs_flash
         esp_netif
         esp_event
-        esp_wifi
 )
