@@ -14,6 +14,9 @@ static const char *TAG = "UART_HANDLER";
 
 static QueueHandle_t tx_queue = NULL;
 
+// Внешняя функция из main.c для обработки ответов
+extern void matter_update_state_by_cmd(const char *cmd);
+
 void uart_init(void) {
     uart_config_t uart_config = {
         .baud_rate = 115200,
@@ -34,9 +37,15 @@ void uart_init(void) {
 }
 
 void uart_send_command(const char *cmd) {
+    if (!tx_queue || !cmd) return;
+
     char *cmd_copy = strdup(cmd);
     if (cmd_copy) {
-        xQueueSend(tx_queue, &cmd_copy, pdMS_TO_TICKS(100));
+        // Исправлено: если очередь полна, освобождаем память, чтобы избежать утечки
+        if (xQueueSend(tx_queue, &cmd_copy, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGE(TAG, "❌ Очередь TX переполнена! Команда потеряна: %s", cmd);
+            free(cmd_copy);
+        }
     }
 }
 
@@ -47,7 +56,7 @@ static void uart_tx_task(void *pvParameters) {
             uart_write_bytes(UART_MAIN_PORT, cmd, strlen(cmd));
             uart_write_bytes(UART_MAIN_PORT, "\r\n", 2);
             ESP_LOGI(TAG, "📤 Отправлено Главному: %s", cmd);
-            free(cmd);
+            free(cmd); // Память успешно освобождается после отправки
         }
     }
 }
@@ -58,19 +67,27 @@ static void uart_rx_task(void *pvParameters) {
     int pos = 0;
 
     while (1) {
-        int len = uart_read_bytes(UART_MAIN_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(50));
+        // Читаем по одному байту или блоками с таймаутом
+        int len = uart_read_bytes(UART_MAIN_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(20));
+        
         for (int i = 0; i < len; i++) {
+            // Исправлено: обрабатываем любой символ конца строки как триггер отправки
             if (data[i] == '\n' || data[i] == '\r') {
                 if (pos > 0) {
                     line[pos] = '\0';
                     ESP_LOGI(TAG, "📥 Получено от Главного: %s", line);
-                    // Здесь будет обновление состояния Matter лампы
+                    
+                    // Передаем строку в парсер Matter
+                    matter_update_state_by_cmd(line);
+                    
                     pos = 0;
                 }
             } else {
+                // Защита от переполнения буфера `line`
                 if (pos < sizeof(line) - 1) {
                     line[pos++] = data[i];
                 } else {
+                    ESP_LOGW(TAG, "⚠️ Буфер приема переполнен, сброс строки");
                     pos = 0;
                 }
             }
@@ -80,6 +97,7 @@ static void uart_rx_task(void *pvParameters) {
 }
 
 void uart_start_rx_task(void) {
-    xTaskCreate(uart_tx_task, "uart_tx_task", 4096, NULL, 5, NULL);
-    xTaskCreate(uart_rx_task, "uart_rx_task", 4096, NULL, 5, NULL);
+    // Выделяем стек с запасом (2048-3072 байт обычно хватает для простых задач ввода-вывода)
+    xTaskCreate(uart_tx_task, "uart_tx_task", 3072, NULL, 5, NULL);
+    xTaskCreate(uart_rx_task, "uart_rx_task", 3072, NULL, 5, NULL);
 }
