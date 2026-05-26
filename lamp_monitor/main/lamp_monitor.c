@@ -21,52 +21,69 @@ static const char *TAG = "MONITOR";
 #define WIFI_CHANNEL       1
 
 // ==================== ESP-NOW ====================
-// MAC Главного (ESP32-C6 №2)
+// MAC Главного
 static const uint8_t main_mac[6] = {0x20, 0x6E, 0xF1, 0x13, 0x99, 0xE4};
 
 // ==================== ОЧЕРЕДЬ СОБЫТИЙ ====================
 typedef enum {
-    EV_SEND_REQUESTED
+    EV_SEND_REQUESTED,  // Задача 1: Запрос от Главного
+    EV_STATE_CHANGED    // Задача 2: Реальное изменение состояния ламп
 } event_type_t;
 
 static QueueHandle_t event_queue = NULL;
 
 // ==================== СОСТОЯНИЕ ЛАМП ====================
-// ФИКСИРОВАННОЕ СОСТОЯНИЕ: лампы 1, 3, 17 включены
-// Бит 0 = лампа 1 (1 << 0) = 0x00000001
-// Бит 2 = лампа 3 (1 << 2) = 0x00000004
-// Бит 16 = лампа 17 (1 << 16) = 0x00010000
-// Итого: 0x00010005
+// Стартовое состояние: лампы 1, 3, 17 включены (0x00010005)
 static _Atomic uint32_t lamp_state = ATOMIC_VAR_INIT(0x00010005);
 
 // ==================== ОТПРАВКА СТАТУСА ====================
 static void send_status(uint32_t state) {
     esp_err_t ret = esp_now_send(main_mac, (const uint8_t*)&state, sizeof(state));
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "📤 Статус отправлен: %08" PRIX32, state);
-        ESP_LOGI(TAG, "   Включены лампы: 1, 3, 17");
+        ESP_LOGI(TAG, "📤 Пакет ушел Главному. Маска: %08" PRIX32, state);
     } else {
         ESP_LOGE(TAG, "❌ Ошибка отправки: %s", esp_err_to_name(ret));
     }
 }
 
-// ==================== ОБРАБОТКА ЗАПРОСА ОТ ГЛАВНОГО ====================
+// ==================== ЗАДАЧА 1: ОБРАБОТКА ЗАПРОСА ОТ ГЛАВНОГО ====================
 static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     if (info == NULL || data == NULL || len <= 0) return;
     if (memcmp(info->src_addr, main_mac, 6) != 0) return;
 
+    // Главный прислал команду опроса (0x01)
     if (len == 1 && data[0] == 0x01) {
         event_type_t ev = EV_SEND_REQUESTED;
+        // Толкаем в очередь из контекста прерывания (ISR)
         xQueueSendFromISR(event_queue, &ev, NULL);
     }
 }
 
-// ==================== ESP-NOW ====================
+// ==================== ЗАДАЧА 2: ИМИТАЦИЯ ИЗМЕНЕНИЯ СОСТОЯНИЯ (ТАЙМЕР) ====================
+// В реальном железе здесь будет опрос GPIO/микросхем расширителей.
+// Если новое считанное состояние не совпадает со старым — вызываем этот триггер.
+static void timer_callback(void* arg) {
+    uint32_t mask_lamp_1 = (1UL << 0);
+    
+    // Атомарно инвертируем Лампу 1
+    uint32_t old_state = atomic_fetch_xor(&lamp_state, mask_lamp_1);
+    uint32_t new_state = old_state ^ mask_lamp_1;
+
+    ESP_LOGW(TAG, "⏰ [Событие] Лампа 1 изменила состояние: %s -> %s",
+             (old_state & mask_lamp_1) ? "ON" : "OFF",
+             (new_state & mask_lamp_1) ? "ON" : "OFF");
+
+    // Состояние изменилось! Отправляем сигнал в очередь
+    event_type_t ev = EV_STATE_CHANGED;
+    xQueueSend(event_queue, &ev, portMAX_DELAY);
+}
+
+// ==================== ESP-NOW CALLBACK СТАТУСА ====================
 static void on_data_sent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status) {
     if (status == ESP_NOW_SEND_SUCCESS) {
-        ESP_LOGD(TAG, "✅ Доставлено");
+        ESP_LOGD(TAG, "✅ Доставлено Главному");
     } else {
-        ESP_LOGW(TAG, "⚠️ Не доставлено");
+        ESP_LOGW(TAG, "⚠️ Сбой доставки пакета Главному");
     }
 }
 
@@ -92,16 +109,27 @@ static void init_espnow(void) {
     memcpy(peer.peer_addr, main_mac, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
     
-    ESP_LOGI(TAG, "📡 Peer Главного добавлен");
+    ESP_LOGI(TAG, "📡 Связь с Главным настроена");
 }
 
-// ==================== ЗАДАЧА ОТПРАВКИ ====================
+// ==================== ЕДИНАЯ СЛУЖБА ОТПРАВКИ МАСКИ ====================
 static void monitor_tx_task(void *pvParameters) {
     event_type_t ev;
     while (1) {
+        // Задача спит, пока в очереди нет событий
         if (xQueueReceive(event_queue, &ev, portMAX_DELAY) == pdTRUE) {
+            
+            // Читаем текущую полную маску всех 32 ламп
             uint32_t current_state = atomic_load(&lamp_state);
-            ESP_LOGI(TAG, "🔍 Отправка по запросу: %08" PRIX32, current_state);
+            
+            if (ev == EV_SEND_REQUESTED) {
+                ESP_LOGI(TAG, "🔍 [Задача 1] Ответ по запросу Главного: %08" PRIX32, current_state);
+            } 
+            else if (ev == EV_STATE_CHANGED) {
+                ESP_LOGW(TAG, "📢 [Задача 2] Инициативный доклад об изменении ламп: %08" PRIX32, current_state);
+            }
+            
+            // Отправляем всю маску
             send_status(current_state);
         }
     }
@@ -116,25 +144,35 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    // Создаем очередь для событий
     event_queue = xQueueCreate(10, sizeof(event_type_t));
     if (event_queue == NULL) {
-        ESP_LOGE(TAG, "❌ Ошибка создания очереди");
+        ESP_LOGE(TAG, "❌ Ошибка создания очереди событий");
         return;
     }
 
+    // Запускаем диспетчер отправки
     xTaskCreate(monitor_tx_task, "monitor_tx_task", 4096, NULL, 5, NULL);
 
     init_espnow();
 
+    // Инициализация периодического таймера для имитации Задача 2 (раз в 30 сек)
+    const esp_timer_create_args_t periodic_timer_args = {
+        .callback = &timer_callback,
+        .name = "periodic_lamp_timer"
+    };
+    esp_timer_handle_t periodic_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 30ULL * 1000000ULL));
+
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    ESP_LOGI(TAG, "═══════════════════════════════════════════");
-    ESP_LOGI(TAG, "🟢 Смотрящий запущен (ФИКСИРОВАННОЕ СОСТОЯНИЕ)");
-    ESP_LOGI(TAG, "📡 MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "💡 Постоянное состояние: лампы 1, 3, 17 включены");
-    ESP_LOGI(TAG, "🔍 Отвечаю только на запросы GET_STATE");
-    ESP_LOGI(TAG, "═══════════════════════════════════════════");
     
-    // Таймер ОТКЛЮЧЁН — состояние никогда не меняется
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
+    ESP_LOGI(TAG, "🟢 Смотрящий запущен в ГИБРИДНОМ режиме");
+    ESP_LOGI(TAG, "📡 Мой MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "1️⃣ Функция 1: Стенд отвечает на запросы GET_STATE (0x01)");
+    ESP_LOGI(TAG, "2️⃣ Функция 2: При изменении любой лампы шлет маску сам");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════");
 }
