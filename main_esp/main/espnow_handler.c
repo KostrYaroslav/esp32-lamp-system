@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -9,6 +10,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_idf_version.h"
+#include "driver/uart.h" // Добавлено для прямой отправки в UART
 #include "espnow_handler.h"
 #include "state_manager.h"
 
@@ -19,6 +21,7 @@ static const uint8_t controller_mac[6] = {0x68, 0xFE, 0x71, 0x88, 0x8E, 0x48};
 
 #define WIFI_CHANNEL 1
 #define CMD_GET_STATE 0x01
+#define MATTER_UART_NUM UART_NUM_1 // Порт для интеграции с Matter
 
 static SemaphoreHandle_t state_semaphore = NULL;
 static volatile bool waiting = false; 
@@ -27,6 +30,29 @@ typedef struct {
     uint32_t mask;
     uint8_t action;
 } __attribute__((packed)) controller_pkt_t;
+
+// Внутренняя функция обработки пакета: вызывается ВСЕГДА при получении 4 байт
+static void handle_received_state(uint32_t state) {
+    // 1. Обновляем текущее состояние в памяти Главного
+    state_manager_update_state(state);
+    
+    // 2. ВСЕГДА отправляем всю маску в Matter по UART (в HEX формате)
+    char uart_buf[32];
+    snprintf(uart_buf, sizeof(uart_buf), "Lamp Mask: %08X\r\n", (unsigned int)state);
+    uart_write_bytes(MATTER_UART_NUM, uart_buf, strlen(uart_buf));
+
+    // Лог отправки для отладки
+    ESP_LOGI(TAG, "🚀 Маска отправлена в UART: %08X", (unsigned int)state);
+
+    // 3. Если мы сами ждали этот пакет (в режиме запроса) — пинаем семафор
+    if (waiting) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(state_semaphore, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void on_data_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -38,15 +64,7 @@ static void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) 
     if (len == 4) {
         uint32_t state;
         memcpy(&state, data, 4);
-        state_manager_update_state(state);
-        
-        if (waiting) {
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            xSemaphoreGiveFromISR(state_semaphore, &xHigherPriorityTaskWoken);
-            if (xHigherPriorityTaskWoken == pdTRUE) {
-                portYIELD_FROM_ISR();
-            }
-        }
+        handle_received_state(state);
     }
 }
 
