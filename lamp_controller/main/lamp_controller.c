@@ -102,18 +102,18 @@ static void hc595_update(uint32_t state) {
 }
 
 static void hc595_set_channels(uint32_t mask, bool state) {
-    portENTER_CRITICAL(&reg_mux);
+    uint32_t local_state;
     
+    portENTER_CRITICAL(&reg_mux);
     if (state) {
         shift_reg_state |= mask;
     } else {
         shift_reg_state &= ~mask;
     }
-    
-    // Исправлено: Обновление пинов происходит внутри критической секции.
-    hc595_update(shift_reg_state);
-    
+    local_state = shift_reg_state;
     portEXIT_CRITICAL(&reg_mux);
+    
+    hc595_update(local_state);  // ← ВНЕ критической секции
 }
 
 // Коллбэк таймера: выключает конкретное реле
