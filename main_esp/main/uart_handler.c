@@ -15,15 +15,11 @@ static const char *TAG = "UART";
 #define UART_TERM_PORT UART_NUM_0
 #define BUF_SIZE 256
 
-// Мьютекс для разделения доступа к менеджеру состояний между задачами
 static SemaphoreHandle_t cmd_mutex = NULL;
 
 void uart_init(void) {
     cmd_mutex = xSemaphoreCreateMutex();
-    if (cmd_mutex == NULL) {
-        ESP_LOGE(TAG, "❌ Ошибка мьютекса UART команд");
-    }
-
+    
     uart_config_t cfg = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -32,12 +28,13 @@ void uart_init(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_param_config(UART_MATTER_PORT, &cfg);
-    uart_set_pin(UART_MATTER_PORT, UART_MATTER_TXD, UART_MATTER_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(UART_MATTER_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+    
+    ESP_ERROR_CHECK(uart_param_config(UART_MATTER_PORT, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(UART_MATTER_PORT, UART_MATTER_TXD, UART_MATTER_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_MATTER_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
     
     if (!uart_is_driver_installed(UART_TERM_PORT)) {
-        uart_driver_install(UART_TERM_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0);
+        ESP_ERROR_CHECK(uart_driver_install(UART_TERM_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 0, NULL, 0));
     }
     ESP_LOGI(TAG, "✅ Драйверы UART настроены");
 }
@@ -52,7 +49,7 @@ static void terminal_task(void *pv) {
     char line[BUF_SIZE];
     int pos = 0;
     ESP_LOGI(TAG, "⌨️ Консоль отладки активна.");
-    
+
     while (1) {
         int len = uart_read_bytes(UART_TERM_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(50));
         for (int i = 0; i < len; i++) {
@@ -60,7 +57,6 @@ static void terminal_task(void *pv) {
                 if (pos > 0) {
                     line[pos] = '\0';
                     parsed_cmd_t cmd = parse_command(line);
-                    
                     if (cmd.type == CMD_HELP) {
                         ESP_LOGI(TAG, "Доступно: ON X, OFF X, ALL_ON, ALL_OFF, STATUS, MASK_SET X, MASK_CLR X");
                     } else if (cmd.type != CMD_UNKNOWN) {
@@ -77,7 +73,6 @@ static void terminal_task(void *pv) {
                 if (pos < sizeof(line) - 1) {
                     line[pos++] = data[i];
                 } else {
-                    ESP_LOGE(TAG, "Переполнение буфера терминала, сброс!");
                     pos = 0;
                 }
             }
@@ -90,7 +85,7 @@ static void matter_rx_task(void *pv) {
     uint8_t data[BUF_SIZE];
     char line[BUF_SIZE];
     int pos = 0;
-    
+
     while (1) {
         int len = uart_read_bytes(UART_MATTER_PORT, data, sizeof(data) - 1, pdMS_TO_TICKS(50));
         for (int i = 0; i < len; i++) {
@@ -110,7 +105,6 @@ static void matter_rx_task(void *pv) {
                 if (pos < sizeof(line) - 1) {
                     line[pos++] = data[i];
                 } else {
-                    ESP_LOGE(TAG, "Переполнение буфера Matter, сброс!");
                     pos = 0;
                 }
             }

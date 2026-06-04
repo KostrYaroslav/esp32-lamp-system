@@ -5,3 +5,4 @@
 void espnow_init(void);
 void espnow_send_to_controller(uint32_t mask, bool set);
 bool espnow_request_state(void);
+bool espnow_dialog_with_controller(uint32_t mask, bool set);
